@@ -1,0 +1,115 @@
+name: Auto-Deploy New Repos
+
+on:
+  schedule:
+    - cron: '*/10 * * * *' # runs every 10 minutes
+  workflow_dispatch:
+
+jobs:
+  check-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v3
+
+      - name: Setup GitHub CLI and jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+          echo "GitHub CLI and jq installed"
+
+      - name: Fetch repositories
+        env:
+          GH_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        run: |
+          echo "Fetching repositories for Prish399..."
+          gh repo list Prish399 --limit 100 --json name,createdAt > repos.json
+          jq -r '.[].name' repos.json
+
+      - name: Check for new repos and add workflow
+        env:
+          GH_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf temp
+          mkdir -p temp
+          echo "Checking repositories for missing deploy workflows..."
+
+          for repo in $(jq -r '.[].name' repos.json); do
+            echo "=== Processing repo: $repo ==="
+
+            # detect default branch
+            default_branch=$(gh repo view "Prish399/$repo" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || echo "main")
+            echo "Default branch for $repo => $default_branch"
+
+            # clone repo
+            if ! gh repo clone "Prish399/$repo" "temp/$repo" -- --depth=1; then
+              echo "  -> clone failed for $repo, skipping"
+              continue
+            fi
+            cd "temp/$repo"
+
+            # skip if workflow already exists
+            if [ -f ".github/workflows/deploy.yml" ]; then
+              echo "  -> deploy.yml already exists, skipping"
+              cd ../..
+              continue
+            fi
+
+            echo "  -> adding deploy.yml"
+            mkdir -p .github/workflows
+
+            # create deploy workflow
+            printf '%s\n' \
+              'name: Deploy to GitHub Pages' \
+              'on:' \
+              "  push:" \
+              "    branches: [ ${default_branch} ]" \
+              '  workflow_dispatch:' \
+              '' \
+              'permissions:' \
+              '  contents: read' \
+              '  pages: write' \
+              '  id-token: write' \
+              '' \
+              'jobs:' \
+              '  build:' \
+              '    runs-on: ubuntu-latest' \
+              '    steps:' \
+              '      - uses: actions/checkout@v3' \
+              '      - uses: actions/setup-node@v3' \
+              '        with:' \
+              '          node-version: 18' \
+              '      - run: npm ci || npm install' \
+              '      - run: npm run build || npm run build:prod || echo "no build script found"' \
+              '      - uses: actions/upload-pages-artifact@v3' \
+              '        with:' \
+              '          path: ./dist' \
+              '' \
+              '  deploy:' \
+              '    needs: build' \
+              '    runs-on: ubuntu-latest' \
+              '    environment:' \
+              '      name: github-pages' \
+              '      url: ${{ steps.deployment.outputs.page_url }}' \
+              '    steps:' \
+              '      - id: deployment' \
+              '        uses: actions/deploy-pages@v4' \
+              > .github/workflows/deploy.yml
+
+            git config user.name "Auto Deployer"
+            git config user.email "actions@github.com"
+
+            # commit + push
+            if git status --porcelain | grep -q .; then
+              git add .github/workflows/deploy.yml
+              git commit -m "Add auto-deploy workflow" || true
+              git push origin "$default_branch" || true
+              echo "  -> workflow added and pushed to $default_branch"
+            else
+              echo "  -> nothing to commit"
+            fi
+
+            cd ../..
+          done
